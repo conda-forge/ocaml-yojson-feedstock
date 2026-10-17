@@ -1,6 +1,9 @@
 context:
   version: "3.0.0"
-  build_number: 1
+  build_number: 2
+
+  # ELF machine token `file` prints for the target; checked by the arch test
+  elf_arch: ${{ "x86-64" if target_platform == "linux-64" else "aarch64" if target_platform == "linux-aarch64" else "PowerPC" if target_platform == "linux-ppc64le" else "RISC-V" if target_platform == "linux-riscv64" else "S/390" if target_platform == "linux-s390x" else "" }}
 
   # ocaml_win-64 ships gcc_* and vs2022_* at the same version/build; name the track.
   c_toolchain: ${{ "" if unix else c_compiler ~ "_*" }}
@@ -26,6 +29,8 @@ build:
         # Plain cmd.exe, not MSYS2 bash: pure OCaml, no stubs, so no wrapper is
         # needed and the backslashed install prefix reaches dune intact. The
         # dune cache trips over mixed path separators on windows.
+        # dune install also opens the shared cache; disable it for every dune call
+        - set DUNE_CACHE=disabled
         - dune build --cache=disabled --profile=release -p yojson @install
         - if errorlevel 1 exit 1
         - dune install --prefix="%LIBRARY_PREFIX%" --libdir="%LIBRARY_PREFIX%\lib\ocaml" yojson
@@ -51,6 +56,8 @@ requirements:
     - if: build_platform != target_platform and unix
       then:
         - ocaml_${{ build_platform }} ${{ ocaml_compiler_version }}.*
+        # ocaml >=17: the cross compiler activates itself (shims, OCAMLLIB, host OCAMLPATH) and has natdynlink
+        - ocaml_${{ target_platform }}[version="${{ ocaml_compiler_version }}.*", build_number=">=17"]
     # windows cross: the self-contained gcc track needs no vcvars
     - if: build_platform != target_platform and not unix
       then:
@@ -79,6 +86,42 @@ tests:
         - ${{ library }}lib/ocaml/yojson/*
         - ${{ library }}doc/yojson/*
         - ${{ library }}doc/yojson/odoc-pages/*
+  # cross lanes test under qemu binfmt, which would also run a build-machine
+  # binary; check the native objects' ELF headers name the target instead
+  - if: linux
+    then:
+      script:
+        # test scripts are not jinja-rendered; hand the token over by env
+        env:
+          ELF_ARCH: ${{ elf_arch }}
+        content:
+          - |
+            set -eu
+            out=$(file -L "${PREFIX}/bin/ydump")
+            echo "$out"
+            echo "$out" | grep -q "${ELF_ARCH}"
+            n=0
+            for a in $(find "${PREFIX}/lib/ocaml/yojson" -name '*.a'); do
+              n=$((n + 1))
+              d=$(mktemp -d)
+              (cd "$d" && ar x "$a")
+              for o in "$d"/*.o; do
+                out=$(file -L "$o")
+                echo "$out"
+                echo "$out" | grep -q "${ELF_ARCH}"
+              done
+            done
+            test "$n" -gt 0
+            for s in "${PREFIX}"/lib/ocaml/stublibs/dll*yojson*.so; do
+              [ -e "$s" ] || continue
+              out=$(file -L "$s")
+              echo "$out"
+              echo "$out" | grep -q "${ELF_ARCH}"
+            done
+      requirements:
+        build:
+          - file
+          - binutils
 
 about:
   homepage: https://github.com/ocaml-community/yojson
